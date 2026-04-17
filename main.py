@@ -206,11 +206,8 @@ async def serve_playlist(request: Request):
             execute(conn,
                 "UPDATE m3u_lists SET last_accessed=%s WHERE id=%s",
                 (datetime.now(), row["id"]))
-            token = row["session_token"]
             raw = await fetch_raw_m3u(row)
-            return PlainTextResponse(
-                rewrite_m3u_urls(raw, get_base_url(request), token),
-                media_type="audio/x-mpegurl")
+            return PlainTextResponse(raw, media_type="audio/x-mpegurl")
 
         available = fetchone(conn,
             "SELECT * FROM m3u_lists WHERE status='available' ORDER BY RANDOM() LIMIT 1")
@@ -219,21 +216,18 @@ async def serve_playlist(request: Request):
             busy = "#EXTM3U\n#EXTINF:-1,Todas as listas estao em uso. Tente novamente.\nhttp://0.0.0.0\n"
             return PlainTextResponse(busy, media_type="audio/x-mpegurl", status_code=503)
 
-        token = secrets.token_urlsafe(16)
         execute(conn, """
             UPDATE m3u_lists
-            SET status='in_use', session_ip=%s, session_token=%s, last_accessed=%s
+            SET status='in_use', session_ip=%s, last_accessed=%s
             WHERE id=%s
-        """, (ip, token, datetime.now(), available["id"]))
+        """, (ip, datetime.now(), available["id"]))
         execute(conn,
             "INSERT INTO access_log (ip_address, list_id, list_name, action) VALUES (%s,%s,%s,'assigned')",
             (ip, available["id"], available["name"]))
 
         raw = await fetch_raw_m3u(available)
         logger.info(f"List '{available['name']}' assigned to {ip}")
-        return PlainTextResponse(
-            rewrite_m3u_urls(raw, get_base_url(request), token),
-            media_type="audio/x-mpegurl")
+        return PlainTextResponse(raw, media_type="audio/x-mpegurl")
 
 
 # ---------- Public: stream redirect ----------
