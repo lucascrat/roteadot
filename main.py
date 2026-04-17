@@ -20,7 +20,16 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "M3uPro@2026!")
 SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
 CACHE_TTL_HOURS = int(os.getenv("CACHE_TTL_HOURS", "6"))
 CACHE_REFRESH_MINUTES = int(os.getenv("CACHE_REFRESH_MINUTES", "60"))
+PROVIDER_BASE = os.getenv(
+    "PROVIDER_BASE",
+    "http://gfbegin.top:8880/get.php?username={username}&password={password}&type=m3u_plus&output=m3u8",
+)
 MAX_LISTS = 10
+
+
+def build_provider_url(username: str, password: str) -> str:
+    from urllib.parse import quote
+    return PROVIDER_BASE.format(username=quote(username, safe=""), password=quote(password, safe=""))
 
 admin_sessions: dict[str, datetime] = {}
 
@@ -348,6 +357,8 @@ async def dashboard(request: Request, admin_token: str = Cookie(default=None)):
 async def add_list(
     request: Request,
     name: str = Form(...),
+    username: str = Form(default=""),
+    password: str = Form(default=""),
     source_url: str = Form(default=""),
     content: str = Form(default=""),
     admin_token: str = Cookie(default=None),
@@ -364,12 +375,17 @@ async def add_list(
         conn.close()
         return RedirectResponse(f"/admin?msg=Limite+de+{MAX_LISTS}+listas+atingido", status_code=302)
 
+    u = username.strip()
+    p = password.strip()
     url = source_url.strip() or None
     body = content.strip() or None
 
+    if u and p:
+        url = build_provider_url(u, p)
+
     if not url and not body:
         conn.close()
-        return RedirectResponse("/admin?msg=Informe+URL+ou+conteudo", status_code=302)
+        return RedirectResponse("/admin?msg=Informe+usuario+e+senha+ou+URL", status_code=302)
 
     conn.execute(
         "INSERT INTO m3u_lists (name, source_url, content) VALUES (?,?,?)",
