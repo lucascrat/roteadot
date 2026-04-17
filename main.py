@@ -1,4 +1,5 @@
 import os
+import gzip
 import secrets
 import logging
 from datetime import datetime, timedelta
@@ -77,6 +78,10 @@ def init_db():
         conn.execute("ALTER TABLE m3u_lists ADD COLUMN username TEXT")
     if "password" not in existing:
         conn.execute("ALTER TABLE m3u_lists ADD COLUMN password TEXT")
+    if "cached_gzip" not in existing:
+        conn.execute("ALTER TABLE m3u_lists ADD COLUMN cached_gzip BLOB")
+    # Libera espaco do cache antigo em texto
+    conn.execute("UPDATE m3u_lists SET cached_content=NULL WHERE cached_content IS NOT NULL")
     conn.commit()
     conn.close()
     logger.info("Database initialised")
@@ -95,6 +100,14 @@ def cleanup_expired_sessions():
     conn.close()
     if released:
         logger.info(f"Released {released} expired session(s)")
+
+
+def _gz(text: str) -> bytes:
+    return gzip.compress(text.encode("utf-8"), compresslevel=6)
+
+
+def _gunz(blob: bytes) -> str:
+    return gzip.decompress(blob).decode("utf-8")
 
 
 def rewrite_credentials(template: str, from_user: str, from_pass: str, to_user: str, to_pass: str) -> str:
@@ -141,14 +154,15 @@ async def refresh_all_caches():
                     resp.raise_for_status()
                     content = resp.text
                 if _is_valid_m3u(content):
+                    blob = _gz(content)
                     c = get_db()
                     c.execute(
-                        "UPDATE m3u_lists SET cached_content=?, cached_at=? WHERE id=?",
-                        (content, datetime.now(), row["id"]),
+                        "UPDATE m3u_lists SET cached_gzip=?, cached_at=? WHERE id=?",
+                        (blob, datetime.now(), row["id"]),
                     )
                     c.commit()
                     c.close()
-                    logger.info(f"Cache atualizado lista id={row['id']} ({len(content)} bytes)")
+                    logger.info(f"Cache lista id={row['id']} atualizado ({len(content)} -> {len(blob)} bytes)")
             except Exception as exc:
                 logger.error(f"Erro no refresh da lista id={row['id']}: {exc}")
         return
@@ -183,16 +197,17 @@ async def refresh_all_caches():
             logger.warning(f"Lista id={row['id']} sem usuario/senha — cache nao derivado")
             continue
 
+        blob = _gz(derived)
         c = get_db()
         c.execute(
-            "UPDATE m3u_lists SET cached_content=?, cached_at=? WHERE id=?",
-            (derived, now, row["id"]),
+            "UPDATE m3u_lists SET cached_gzip=?, cached_at=? WHERE id=?",
+            (blob, now, row["id"]),
         )
         c.commit()
         c.close()
     logger.info(
-        f"Cache refrescado via template (lista id={template_row['id']}, {len(template_content)} bytes) "
-        f"para {len(rows)} lista(s)"
+        f"Cache refrescado via template (lista id={template_row['id']}, {len(template_content)} -> "
+        f"~{len(_gz(template_content))} bytes gzip) para {len(rows)} lista(s)"
     )
 
 
@@ -249,20 +264,27 @@ def _is_valid_m3u(text: str) -> bool:
     return "#EXTINF" in text and len(text) > 100
 
 
-async def fetch_m3u_content(row, conn=None) -> str:
+PLAYLIST_HEADERS = {
+    "Cache-Control": "public, max-age=300",
+    "Content-Disposition": 'inline; filename="playlist.m3u"',
+}
+
+
+async def fetch_m3u_gzip(row, conn=None) -> bytes:
+    """Retorna o conteudo M3U ja gzipado, pronto para servir."""
     row = dict(row)
     if not row.get("source_url"):
-        return row.get("content") or "#EXTM3U\n"
+        manual = row.get("content") or "#EXTM3U\n"
+        return _gz(manual)
 
-    # Serve from cache if fresh
-    cached = row.get("cached_content")
+    cached_blob = row.get("cached_gzip")
     cached_at = row.get("cached_at")
-    if cached and cached_at and _is_valid_m3u(cached):
+    if cached_blob and cached_at:
         try:
             ts = cached_at if isinstance(cached_at, datetime) else datetime.fromisoformat(str(cached_at))
             if datetime.now() - ts < timedelta(hours=CACHE_TTL_HOURS):
-                logger.info(f"Cache hit lista id={row['id']} ({len(cached)} bytes)")
-                return cached
+                logger.info(f"Cache hit lista id={row['id']} ({len(cached_blob)} bytes gzip)")
+                return cached_blob
         except Exception:
             pass
 
@@ -273,32 +295,46 @@ async def fetch_m3u_content(row, conn=None) -> str:
             content = resp.text
             logger.info(f"Buscou {len(content)} bytes de {row['source_url']}")
             if _is_valid_m3u(content):
+                blob = _gz(content)
                 if conn is not None:
                     conn.execute(
-                        "UPDATE m3u_lists SET cached_content=?, cached_at=? WHERE id=?",
-                        (content, datetime.now(), row["id"]),
+                        "UPDATE m3u_lists SET cached_gzip=?, cached_at=? WHERE id=?",
+                        (blob, datetime.now(), row["id"]),
                     )
                     conn.commit()
-                return content
-            # Provider returned empty/invalid — fall back to last good cache if any
-            if cached and _is_valid_m3u(cached):
-                logger.warning(f"Provedor retornou vazio; servindo cache antigo da lista id={row['id']}")
-                return cached
-            return "#EXTM3U\n#EXTINF:-1,Lista vazia do provedor\nhttp://0.0.0.0\n"
+                return blob
+            if cached_blob:
+                logger.warning(f"Provedor vazio; servindo cache antigo da lista id={row['id']}")
+                return cached_blob
+            return _gz("#EXTM3U\n#EXTINF:-1,Lista vazia do provedor\nhttp://0.0.0.0\n")
     except Exception as exc:
         logger.error(f"Erro ao buscar M3U ({row.get('source_url')}): {exc}")
-        if cached and _is_valid_m3u(cached):
+        if cached_blob:
             logger.warning(f"Erro no fetch; servindo cache antigo da lista id={row['id']}")
-            return cached
-        return f"#EXTM3U\n#EXTINF:-1,Erro: {exc}\nhttp://0.0.0.0\n"
+            return cached_blob
+        return _gz(f"#EXTM3U\n#EXTINF:-1,Erro: {exc}\nhttp://0.0.0.0\n")
+
+
+def playlist_response(blob: bytes, accept_encoding: str, status_code: int = 200) -> Response:
+    headers = {**PLAYLIST_HEADERS}
+    if "gzip" in (accept_encoding or "").lower():
+        headers["Content-Encoding"] = "gzip"
+        return Response(
+            content=blob,
+            media_type="audio/x-mpegurl",
+            headers=headers,
+            status_code=status_code,
+        )
+    # Cliente nao aceita gzip — descompacta
+    return Response(
+        content=gzip.decompress(blob),
+        media_type="audio/x-mpegurl",
+        headers=headers,
+        status_code=status_code,
+    )
 
 
 # ---------- Public endpoint ----------
-
-PLAYLIST_HEADERS = {
-    "Cache-Control": "public, max-age=300",
-    "Content-Disposition": 'inline; filename="playlist.m3u"',
-}
 
 
 @app.get("/playlist.m3u", response_class=PlainTextResponse)
@@ -321,16 +357,18 @@ async def serve_playlist(request: Request):
         "SELECT * FROM m3u_lists WHERE status='in_use' AND session_ip=?", (ip,)
     ).fetchone()
 
+    accept_enc = request.headers.get("accept-encoding", "")
+
     if row:
         conn.execute(
             "UPDATE m3u_lists SET last_accessed=? WHERE id=?",
             (datetime.now(), row["id"]),
         )
         conn.commit()
-        content = await fetch_m3u_content(row, conn)
+        blob = await fetch_m3u_gzip(row, conn)
         conn.close()
-        _log_timing("reuse", len(content))
-        return PlainTextResponse(content, media_type="audio/x-mpegurl", headers=PLAYLIST_HEADERS)
+        _log_timing("reuse", len(blob))
+        return playlist_response(blob, accept_enc)
 
     # Atribuicao atomica: UPDATE com WHERE status='available' garante
     # que apenas uma requisicao consiga marcar a lista como in_use.
@@ -341,8 +379,8 @@ async def serve_playlist(request: Request):
     if not available:
         conn.rollback()
         conn.close()
-        busy = "#EXTM3U\n#EXTINF:-1,Todas as listas estao em uso. Tente novamente em alguns minutos.\nhttp://0.0.0.0\n"
-        return PlainTextResponse(busy, media_type="audio/x-mpegurl", status_code=503)
+        busy = _gz("#EXTM3U\n#EXTINF:-1,Todas as listas estao em uso. Tente novamente em alguns minutos.\nhttp://0.0.0.0\n")
+        return playlist_response(busy, accept_enc, status_code=503)
 
     cur = conn.execute("""
         UPDATE m3u_lists
@@ -351,22 +389,21 @@ async def serve_playlist(request: Request):
     """, (ip, datetime.now(), available["id"]))
 
     if cur.rowcount == 0:
-        # Outra requisicao pegou essa lista entre o SELECT e o UPDATE
         conn.rollback()
         conn.close()
         logger.warning(f"Corrida detectada ao atribuir lista id={available['id']} para {ip}")
-        retry = "#EXTM3U\n#EXTINF:-1,Tente novamente em alguns segundos.\nhttp://0.0.0.0\n"
-        return PlainTextResponse(retry, media_type="audio/x-mpegurl", status_code=503)
+        retry = _gz("#EXTM3U\n#EXTINF:-1,Tente novamente em alguns segundos.\nhttp://0.0.0.0\n")
+        return playlist_response(retry, accept_enc, status_code=503)
     conn.execute(
         "INSERT INTO access_log (ip_address, list_id, list_name, action) VALUES (?,?,?,'assigned')",
         (ip, available["id"], available["name"]),
     )
     conn.commit()
-    content = await fetch_m3u_content(available)
+    blob = await fetch_m3u_gzip(available)
     conn.close()
     logger.info(f"List '{available['name']}' assigned to {ip}")
-    _log_timing("assign", len(content))
-    return PlainTextResponse(content, media_type="audio/x-mpegurl", headers=PLAYLIST_HEADERS)
+    _log_timing("assign", len(blob))
+    return playlist_response(blob, accept_enc)
 
 
 # ---------- Admin: auth ----------
@@ -425,8 +462,8 @@ async def dashboard(request: Request, admin_token: str = Cookie(default=None)):
                 age_min = int((now_dt - ts).total_seconds() // 60)
             except Exception:
                 pass
-        if d.get("cached_content"):
-            size_kb = len(d["cached_content"]) // 1024
+        if d.get("cached_gzip"):
+            size_kb = len(d["cached_gzip"]) // 1024
         d["cache_age_min"] = age_min
         d["cache_size_kb"] = size_kb
         lists.append(d)
