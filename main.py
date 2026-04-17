@@ -20,6 +20,11 @@ DB_PATH = os.getenv("DB_PATH", "data/roteador.db")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "M3uPro@2026!")
 SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT_MINUTES", "10"))
 CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "1"))
+ACTIVE_CHECK_SECONDS = int(os.getenv("ACTIVE_CHECK_SECONDS", "45"))
+PROVIDER_API_BASE = os.getenv(
+    "PROVIDER_API_BASE",
+    "http://gfbegin.top:8880/player_api.php?username={username}&password={password}",
+)
 CACHE_TTL_HOURS = int(os.getenv("CACHE_TTL_HOURS", "6"))
 CACHE_REFRESH_MINUTES = int(os.getenv("CACHE_REFRESH_MINUTES", "60"))
 PROVIDER_BASE = os.getenv(
@@ -85,6 +90,83 @@ def init_db():
     conn.commit()
     conn.close()
     logger.info("Database initialised")
+
+
+async def check_active_connections():
+    """Pergunta ao provedor Xtream quantas conexoes estao ativas por credencial.
+
+    - active_cons > 0: usuario ainda assistindo -> atualiza last_accessed
+    - active_cons == 0: ninguem conectado -> libera a lista imediatamente
+
+    Isso torna a deteccao de "logado/deslogado" quase imediata,
+    independente do timeout fixo.
+    """
+    from urllib.parse import quote
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, name, username, password, session_ip, last_accessed "
+        "FROM m3u_lists WHERE status='in_use' AND username IS NOT NULL AND password IS NOT NULL"
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return
+
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True, headers=IPTV_HEADERS) as client:
+        for row in rows:
+            url = PROVIDER_API_BASE.format(
+                username=quote(row["username"], safe=""),
+                password=quote(row["password"], safe=""),
+            )
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+                user_info = data.get("user_info", {}) if isinstance(data, dict) else {}
+                active_raw = user_info.get("active_cons", 0)
+                try:
+                    active = int(active_raw)
+                except (TypeError, ValueError):
+                    active = 0
+            except Exception as exc:
+                logger.warning(f"player_api falhou lista id={row['id']}: {exc} — mantendo sessao")
+                continue
+
+            c = get_db()
+            if active > 0:
+                c.execute(
+                    "UPDATE m3u_lists SET last_accessed=? WHERE id=? AND status='in_use'",
+                    (datetime.now(), row["id"]),
+                )
+                c.commit()
+                c.close()
+                logger.info(f"Lista id={row['id']} ativa no provedor (active_cons={active})")
+            else:
+                # Confirma que esta sem conexao ha pelo menos uns segundos
+                # para evitar corrida entre player abrindo stream e API.
+                last = row["last_accessed"]
+                try:
+                    ts = last if isinstance(last, datetime) else datetime.fromisoformat(str(last))
+                    idle_sec = (datetime.now() - ts).total_seconds()
+                except Exception:
+                    idle_sec = 9999
+                if idle_sec < 60:
+                    c.close()
+                    logger.info(f"Lista id={row['id']} sem conexao mas recem-atribuida ({idle_sec:.0f}s) — aguardando")
+                    continue
+                c.execute(
+                    "UPDATE m3u_lists SET status='available', session_ip=NULL, last_accessed=NULL "
+                    "WHERE id=? AND status='in_use'",
+                    (row["id"],),
+                )
+                c.execute(
+                    "INSERT INTO access_log (ip_address, list_id, list_name, action) "
+                    "VALUES (?,?,?,'released_no_conn')",
+                    (row["session_ip"], row["id"], row["name"]),
+                )
+                c.commit()
+                c.close()
+                logger.info(f"Lista id={row['id']} liberada (active_cons=0, idle={idle_sec:.0f}s)")
 
 
 def cleanup_expired_sessions():
@@ -220,6 +302,7 @@ scheduler = AsyncIOScheduler()
 async def lifespan(app: FastAPI):
     init_db()
     scheduler.add_job(cleanup_expired_sessions, "interval", minutes=CLEANUP_INTERVAL_MINUTES)
+    scheduler.add_job(check_active_connections, "interval", seconds=ACTIVE_CHECK_SECONDS, max_instances=1)
     scheduler.add_job(refresh_all_caches, "interval", minutes=CACHE_REFRESH_MINUTES)
     scheduler.add_job(refresh_all_caches, "date", run_date=datetime.now() + timedelta(seconds=15))
     scheduler.start()
