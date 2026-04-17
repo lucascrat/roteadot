@@ -109,17 +109,25 @@ def is_admin(admin_token: str | None) -> bool:
     return True
 
 
+IPTV_HEADERS = {
+    "User-Agent": "VLC/3.0.20 LibVLC/3.0.20",
+    "Accept": "*/*",
+    "Connection": "keep-alive",
+}
+
 async def fetch_m3u_content(row) -> str:
     row = dict(row)
     if row.get("source_url"):
         try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=IPTV_HEADERS) as client:
                 resp = await client.get(row["source_url"])
                 resp.raise_for_status()
-                return resp.text
+                content = resp.text
+                logger.info(f"Buscou {len(content)} bytes de {row['source_url']}")
+                return content if content.strip() else "#EXTM3U\n#EXTINF:-1,Lista vazia do provedor\nhttp://0.0.0.0\n"
         except Exception as exc:
-            logger.error(f"Failed to fetch M3U URL: {exc}")
-            return "#EXTM3U\n#EXTINF:-1,Erro ao buscar lista remota\nhttp://0.0.0.0\n"
+            logger.error(f"Erro ao buscar M3U ({row.get('source_url')}): {exc}")
+            return f"#EXTM3U\n#EXTINF:-1,Erro: {exc}\nhttp://0.0.0.0\n"
     return row.get("content") or "#EXTM3U\n"
 
 
