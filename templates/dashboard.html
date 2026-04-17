@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>M3U Router — Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <meta http-equiv="refresh" content="5" />
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
 
@@ -258,6 +257,13 @@
         }, 2000);
       });
     }
+
+    // Auto-refresh a cada 8s, mas pausa se o formulário estiver aberto
+    setInterval(() => {
+      const form = document.getElementById('add-form');
+      if (form && !form.classList.contains('hidden')) return;
+      location.reload();
+    }, 8000);
   </script>
 </body>
 </html>
