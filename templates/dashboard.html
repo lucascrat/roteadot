@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>M3U Router — Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
 
@@ -185,7 +186,7 @@
           <!-- Last accessed -->
           <div class="flex-shrink-0 text-right hidden md:block">
             {% if l.last_accessed %}
-            <p class="text-gray-600 text-xs">{{ l.last_accessed.strftime('%Y-%m-%d %H:%M') if l.last_accessed else '' }}</p>
+            <p class="text-gray-600 text-xs">{{ l.last_accessed[:16] }}</p>
             {% else %}
             <p class="text-gray-700 text-xs">—</p>
             {% endif %}
@@ -228,7 +229,7 @@
       <div class="divide-y divide-gray-800/60">
         {% for log in logs %}
         <div class="flex items-center gap-4 px-6 py-3 text-sm">
-          <span class="text-gray-600 font-mono text-xs w-36 flex-shrink-0">{{ log.timestamp.strftime('%Y-%m-%d %H:%M') if log.timestamp else '' }}</span>
+          <span class="text-gray-600 font-mono text-xs w-36 flex-shrink-0">{{ log.timestamp[:16] }}</span>
           <span class="font-mono text-blue-400 text-xs w-32 flex-shrink-0 truncate">{{ log.ip_address }}</span>
           <span class="text-gray-300 flex-1 truncate">{{ log.list_name }}</span>
           <span class="text-xs bg-gray-800 text-green-400 px-2 py-0.5 rounded-full">{{ log.action }}</span>
@@ -258,12 +259,12 @@
       });
     }
 
-    // Auto-refresh a cada 8s, mas pausa se o formulário estiver aberto
+    // Atualiza a cada 10s, pausa se o formulário estiver aberto
     setInterval(() => {
       const form = document.getElementById('add-form');
       if (form && !form.classList.contains('hidden')) return;
       location.reload();
-    }, 8000);
+    }, 10000);
   </script>
 </body>
 </html>
