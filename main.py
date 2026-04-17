@@ -72,6 +72,10 @@ def init_db():
         conn.execute("ALTER TABLE m3u_lists ADD COLUMN cached_content TEXT")
     if "cached_at" not in existing:
         conn.execute("ALTER TABLE m3u_lists ADD COLUMN cached_at TIMESTAMP")
+    if "username" not in existing:
+        conn.execute("ALTER TABLE m3u_lists ADD COLUMN username TEXT")
+    if "password" not in existing:
+        conn.execute("ALTER TABLE m3u_lists ADD COLUMN password TEXT")
     conn.commit()
     conn.close()
     logger.info("Database initialised")
@@ -92,33 +96,103 @@ def cleanup_expired_sessions():
         logger.info(f"Released {released} expired session(s)")
 
 
+def rewrite_credentials(template: str, from_user: str, from_pass: str, to_user: str, to_pass: str) -> str:
+    """Substitui credenciais Xtream dentro do conteudo M3U.
+
+    Cobre tanto o formato de querystring (?username=...&password=...)
+    quanto o formato de path (/live/USER/PASS/123.ts).
+    """
+    out = template
+    # Querystring
+    out = out.replace(f"username={from_user}", f"username={to_user}")
+    out = out.replace(f"password={from_pass}", f"password={to_pass}")
+    # Path-style: /USER/PASS/  (precisa de dois replaces posicionais)
+    out = out.replace(f"/{from_user}/{from_pass}/", f"/{to_user}/{to_pass}/")
+    return out
+
+
 async def refresh_all_caches():
-    """Busca o conteudo de todas as listas com source_url e atualiza o cache."""
+    """Busca UMA lista e gera o cache das demais por substituicao de credenciais.
+
+    Todas as listas apontam para o mesmo provedor variando apenas
+    usuario/senha — fazer um unico fetch e substituir e muito mais rapido
+    e reduz carga no provedor.
+    """
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, name, source_url, cached_content FROM m3u_lists WHERE source_url IS NOT NULL AND source_url != ''"
+        "SELECT id, name, source_url, username, password, cached_content "
+        "FROM m3u_lists WHERE source_url IS NOT NULL AND source_url != ''"
     ).fetchall()
     conn.close()
 
+    if not rows:
+        return
+
+    # Escolhe uma lista com usuario/senha como "template"
+    template_row = next((r for r in rows if r["username"] and r["password"]), None)
+
+    if template_row is None:
+        # Sem credenciais salvas — busca cada lista individualmente (fallback)
+        for row in rows:
+            try:
+                async with httpx.AsyncClient(timeout=45, follow_redirects=True, headers=IPTV_HEADERS) as client:
+                    resp = await client.get(row["source_url"])
+                    resp.raise_for_status()
+                    content = resp.text
+                if _is_valid_m3u(content):
+                    c = get_db()
+                    c.execute(
+                        "UPDATE m3u_lists SET cached_content=?, cached_at=? WHERE id=?",
+                        (content, datetime.now(), row["id"]),
+                    )
+                    c.commit()
+                    c.close()
+                    logger.info(f"Cache atualizado lista id={row['id']} ({len(content)} bytes)")
+            except Exception as exc:
+                logger.error(f"Erro no refresh da lista id={row['id']}: {exc}")
+        return
+
+    # Busca o template uma unica vez
+    try:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True, headers=IPTV_HEADERS) as client:
+            resp = await client.get(template_row["source_url"])
+            resp.raise_for_status()
+            template_content = resp.text
+    except Exception as exc:
+        logger.error(f"Erro ao buscar template (lista id={template_row['id']}): {exc}")
+        return
+
+    if not _is_valid_m3u(template_content):
+        logger.warning("Template retornou vazio — cache antigo preservado")
+        return
+
+    now = datetime.now()
+    tpl_user = template_row["username"]
+    tpl_pass = template_row["password"]
+
     for row in rows:
-        try:
-            async with httpx.AsyncClient(timeout=45, follow_redirects=True, headers=IPTV_HEADERS) as client:
-                resp = await client.get(row["source_url"])
-                resp.raise_for_status()
-                content = resp.text
-            if _is_valid_m3u(content):
-                c = get_db()
-                c.execute(
-                    "UPDATE m3u_lists SET cached_content=?, cached_at=? WHERE id=?",
-                    (content, datetime.now(), row["id"]),
-                )
-                c.commit()
-                c.close()
-                logger.info(f"Cache atualizado lista id={row['id']} ({len(content)} bytes)")
-            else:
-                logger.warning(f"Provedor retornou vazio no refresh da lista id={row['id']} — cache antigo mantido")
-        except Exception as exc:
-            logger.error(f"Erro no refresh da lista id={row['id']}: {exc}")
+        if row["id"] == template_row["id"]:
+            derived = template_content
+        elif row["username"] and row["password"]:
+            derived = rewrite_credentials(
+                template_content, tpl_user, tpl_pass, row["username"], row["password"]
+            )
+        else:
+            # Sem credenciais — pula (mantem cache antigo se houver)
+            logger.warning(f"Lista id={row['id']} sem usuario/senha — cache nao derivado")
+            continue
+
+        c = get_db()
+        c.execute(
+            "UPDATE m3u_lists SET cached_content=?, cached_at=? WHERE id=?",
+            (derived, now, row["id"]),
+        )
+        c.commit()
+        c.close()
+    logger.info(
+        f"Cache refrescado via template (lista id={template_row['id']}, {len(template_content)} bytes) "
+        f"para {len(rows)} lista(s)"
+    )
 
 
 # ---------- App lifecycle ----------
@@ -388,8 +462,8 @@ async def add_list(
         return RedirectResponse("/admin?msg=Informe+usuario+e+senha+ou+URL", status_code=302)
 
     conn.execute(
-        "INSERT INTO m3u_lists (name, source_url, content) VALUES (?,?,?)",
-        (name.strip(), url, body),
+        "INSERT INTO m3u_lists (name, source_url, content, username, password) VALUES (?,?,?,?,?)",
+        (name.strip(), url, body, u or None, p or None),
     )
     conn.commit()
     conn.close()
