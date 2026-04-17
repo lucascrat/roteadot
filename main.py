@@ -1,4 +1,5 @@
 import os
+import base64
 import secrets
 import logging
 from datetime import datetime, timedelta
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("DB_PATH", "data/roteador.db")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "M3uPro@2026!")
-SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
+SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT_MINUTES", "10"))
 MAX_LISTS = 10
 
 admin_sessions: dict[str, datetime] = {}
@@ -34,14 +35,15 @@ def init_db():
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS m3u_lists (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            name         TEXT    NOT NULL,
-            source_url   TEXT,
-            content      TEXT,
-            status       TEXT    DEFAULT 'available',
-            session_ip   TEXT,
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT    NOT NULL,
+            source_url    TEXT,
+            content       TEXT,
+            status        TEXT    DEFAULT 'available',
+            session_ip    TEXT,
+            session_token TEXT,
             last_accessed TIMESTAMP,
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS access_log (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +54,12 @@ def init_db():
             timestamp  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    # Migration: add session_token column to existing databases
+    try:
+        conn.execute("ALTER TABLE m3u_lists ADD COLUMN session_token TEXT")
+        conn.commit()
+    except Exception:
+        pass
     conn.commit()
     conn.close()
     logger.info("Database initialised")
@@ -62,7 +70,7 @@ def cleanup_expired_sessions():
     threshold = datetime.now() - timedelta(minutes=SESSION_TIMEOUT)
     conn.execute("""
         UPDATE m3u_lists
-        SET status='available', session_ip=NULL, last_accessed=NULL
+        SET status='available', session_ip=NULL, session_token=NULL, last_accessed=NULL
         WHERE status='in_use' AND last_accessed < ?
     """, (threshold,))
     released = conn.total_changes
@@ -80,9 +88,9 @@ scheduler = AsyncIOScheduler()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    scheduler.add_job(cleanup_expired_sessions, "interval", minutes=5)
+    scheduler.add_job(cleanup_expired_sessions, "interval", minutes=1)
     scheduler.start()
-    logger.info("Scheduler started")
+    logger.info("Scheduler started — checking every 1 min, timeout %d min", SESSION_TIMEOUT)
     yield
     scheduler.shutdown()
 
@@ -102,14 +110,38 @@ def get_client_ip(request: Request) -> str:
 def is_admin(admin_token: str | None) -> bool:
     if not admin_token or admin_token not in admin_sessions:
         return False
-    # expire admin session after 24h
     if datetime.now() - admin_sessions[admin_token] > timedelta(hours=24):
         del admin_sessions[admin_token]
         return False
     return True
 
 
-async def fetch_m3u_content(row) -> str:
+def encode_url(url: str) -> str:
+    return base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+
+
+def decode_url(encoded: str) -> str:
+    padding = 4 - len(encoded) % 4
+    if padding != 4:
+        encoded += "=" * padding
+    return base64.urlsafe_b64decode(encoded.encode()).decode()
+
+
+def rewrite_m3u_urls(content: str, base_url: str, token: str) -> str:
+    """Replace every stream URL in the M3U with a redirect through our /s/ endpoint."""
+    lines = content.splitlines()
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            encoded = encode_url(stripped)
+            result.append(f"{base_url}/s/{token}/{encoded}")
+        else:
+            result.append(line)
+    return "\n".join(result)
+
+
+async def fetch_raw_m3u(row) -> str:
     row = dict(row)
     if row.get("source_url"):
         try:
@@ -123,7 +155,13 @@ async def fetch_m3u_content(row) -> str:
     return row.get("content") or "#EXTM3U\n"
 
 
-# ---------- Public endpoint ----------
+def get_base_url(request: Request) -> str:
+    scheme = "https" if request.headers.get("x-forwarded-proto") == "https" else "http"
+    host = request.headers.get("host", "localhost")
+    return f"{scheme}://{host}"
+
+
+# ---------- Public: playlist ----------
 
 @app.get("/playlist.m3u", response_class=PlainTextResponse)
 async def serve_playlist(request: Request):
@@ -141,7 +179,9 @@ async def serve_playlist(request: Request):
             (datetime.now(), row["id"]),
         )
         conn.commit()
-        content = await fetch_m3u_content(row)
+        token = row["session_token"]
+        raw = await fetch_raw_m3u(row)
+        content = rewrite_m3u_urls(raw, get_base_url(request), token)
         conn.close()
         return PlainTextResponse(content, media_type="audio/x-mpegurl")
 
@@ -155,20 +195,42 @@ async def serve_playlist(request: Request):
         busy = "#EXTM3U\n#EXTINF:-1,Todas as listas estao em uso. Tente novamente em alguns minutos.\nhttp://0.0.0.0\n"
         return PlainTextResponse(busy, media_type="audio/x-mpegurl", status_code=503)
 
+    token = secrets.token_urlsafe(16)
     conn.execute("""
         UPDATE m3u_lists
-        SET status='in_use', session_ip=?, last_accessed=?
+        SET status='in_use', session_ip=?, session_token=?, last_accessed=?
         WHERE id=?
-    """, (ip, datetime.now(), available["id"]))
+    """, (ip, token, datetime.now(), available["id"]))
     conn.execute(
         "INSERT INTO access_log (ip_address, list_id, list_name, action) VALUES (?,?,?,'assigned')",
         (ip, available["id"], available["name"]),
     )
     conn.commit()
-    content = await fetch_m3u_content(available)
+    raw = await fetch_raw_m3u(available)
+    content = rewrite_m3u_urls(raw, get_base_url(request), token)
     conn.close()
-    logger.info(f"List '{available['name']}' assigned to {ip}")
+    logger.info(f"List '{available['name']}' assigned to {ip} (token {token[:8]}…)")
     return PlainTextResponse(content, media_type="audio/x-mpegurl")
+
+
+# ---------- Public: stream redirect (activity tracker) ----------
+
+@app.get("/s/{token}/{encoded}")
+async def stream_redirect(token: str, encoded: str, request: Request):
+    try:
+        original_url = decode_url(encoded)
+    except Exception:
+        raise HTTPException(status_code=400, detail="URL inválida")
+
+    conn = get_db()
+    conn.execute(
+        "UPDATE m3u_lists SET last_accessed=? WHERE session_token=? AND status='in_use'",
+        (datetime.now(), token),
+    )
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse(original_url, status_code=302)
 
 
 # ---------- Admin: auth ----------
@@ -218,9 +280,7 @@ async def dashboard(request: Request, admin_token: str = Cookie(default=None)):
     available = sum(1 for l in lists if l["status"] == "available")
     in_use = total - available
 
-    host = request.headers.get("host", "seu-dominio.com")
-    scheme = "https" if request.headers.get("x-forwarded-proto") == "https" else "http"
-    playlist_url = f"{scheme}://{host}/playlist.m3u"
+    playlist_url = f"{get_base_url(request)}/playlist.m3u"
 
     return templates.TemplateResponse("dashboard.html", {
         "request": request,
@@ -280,7 +340,7 @@ async def release_list(list_id: int, admin_token: str = Cookie(default=None)):
         return RedirectResponse("/admin/login", status_code=302)
     conn = get_db()
     conn.execute(
-        "UPDATE m3u_lists SET status='available', session_ip=NULL, last_accessed=NULL WHERE id=?",
+        "UPDATE m3u_lists SET status='available', session_ip=NULL, session_token=NULL, last_accessed=NULL WHERE id=?",
         (list_id,),
     )
     conn.commit()
@@ -305,7 +365,7 @@ async def release_all(admin_token: str = Cookie(default=None)):
         return RedirectResponse("/admin/login", status_code=302)
     conn = get_db()
     conn.execute(
-        "UPDATE m3u_lists SET status='available', session_ip=NULL, last_accessed=NULL WHERE status='in_use'"
+        "UPDATE m3u_lists SET status='available', session_ip=NULL, session_token=NULL, last_accessed=NULL WHERE status='in_use'"
     )
     conn.commit()
     conn.close()
