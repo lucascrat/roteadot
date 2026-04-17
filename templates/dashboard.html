@@ -209,12 +209,19 @@
             {% endif %}
           </div>
 
-          <!-- Last accessed -->
-          <div class="flex-shrink-0 text-right hidden md:block">
-            {% if l.last_accessed %}
-            <p class="text-gray-600 text-xs">{{ l.last_accessed[:16] }}</p>
+          <!-- Cache info -->
+          <div class="flex-shrink-0 text-right hidden md:block w-32">
+            {% if l.cache_size_kb %}
+            <p class="text-gray-400 text-xs">{{ l.cache_size_kb }} KB</p>
+              {% if l.cache_age_min is not none %}
+                {% if l.cache_age_min < 60 %}
+                <p class="text-green-500 text-xs">cache {{ l.cache_age_min }} min</p>
+                {% else %}
+                <p class="text-yellow-500 text-xs">cache {{ (l.cache_age_min // 60) }}h {{ l.cache_age_min % 60 }}m</p>
+                {% endif %}
+              {% endif %}
             {% else %}
-            <p class="text-gray-700 text-xs">—</p>
+            <p class="text-gray-700 text-xs">sem cache</p>
             {% endif %}
           </div>
 

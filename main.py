@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("DB_PATH", "data/roteador.db")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "M3uPro@2026!")
-SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
+SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT_MINUTES", "10"))
+CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "1"))
 CACHE_TTL_HOURS = int(os.getenv("CACHE_TTL_HOURS", "6"))
 CACHE_REFRESH_MINUTES = int(os.getenv("CACHE_REFRESH_MINUTES", "60"))
 PROVIDER_BASE = os.getenv(
@@ -203,7 +204,7 @@ scheduler = AsyncIOScheduler()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    scheduler.add_job(cleanup_expired_sessions, "interval", minutes=5)
+    scheduler.add_job(cleanup_expired_sessions, "interval", minutes=CLEANUP_INTERVAL_MINUTES)
     scheduler.add_job(refresh_all_caches, "interval", minutes=CACHE_REFRESH_MINUTES)
     scheduler.add_job(refresh_all_caches, "date", run_date=datetime.now() + timedelta(seconds=15))
     scheduler.start()
@@ -302,8 +303,14 @@ PLAYLIST_HEADERS = {
 
 @app.get("/playlist.m3u", response_class=PlainTextResponse)
 async def serve_playlist(request: Request):
+    import time
+    t0 = time.perf_counter()
     ip = get_client_ip(request)
     conn = get_db()
+
+    def _log_timing(tag: str, size: int):
+        ms = (time.perf_counter() - t0) * 1000
+        logger.info(f"/playlist.m3u [{tag}] ip={ip} bytes={size} tempo={ms:.0f}ms")
 
     # Transacao exclusiva: serializa concorrencia para evitar atribuir
     # a mesma lista a dois IPs diferentes ao mesmo tempo.
@@ -322,6 +329,7 @@ async def serve_playlist(request: Request):
         conn.commit()
         content = await fetch_m3u_content(row, conn)
         conn.close()
+        _log_timing("reuse", len(content))
         return PlainTextResponse(content, media_type="audio/x-mpegurl", headers=PLAYLIST_HEADERS)
 
     # Atribuicao atomica: UPDATE com WHERE status='available' garante
@@ -357,6 +365,7 @@ async def serve_playlist(request: Request):
     content = await fetch_m3u_content(available)
     conn.close()
     logger.info(f"List '{available['name']}' assigned to {ip}")
+    _log_timing("assign", len(content))
     return PlainTextResponse(content, media_type="audio/x-mpegurl", headers=PLAYLIST_HEADERS)
 
 
@@ -397,11 +406,30 @@ async def dashboard(request: Request, admin_token: str = Cookie(default=None)):
         return RedirectResponse("/admin/login")
 
     conn = get_db()
-    lists = conn.execute("SELECT * FROM m3u_lists ORDER BY id").fetchall()
+    raw_lists = conn.execute("SELECT * FROM m3u_lists ORDER BY id").fetchall()
     logs = conn.execute(
         "SELECT * FROM access_log ORDER BY timestamp DESC LIMIT 30"
     ).fetchall()
     conn.close()
+
+    now_dt = datetime.now()
+    lists = []
+    for l in raw_lists:
+        d = dict(l)
+        cached_at = d.get("cached_at")
+        age_min = None
+        size_kb = None
+        if cached_at:
+            try:
+                ts = cached_at if isinstance(cached_at, datetime) else datetime.fromisoformat(str(cached_at))
+                age_min = int((now_dt - ts).total_seconds() // 60)
+            except Exception:
+                pass
+        if d.get("cached_content"):
+            size_kb = len(d["cached_content"]) // 1024
+        d["cache_age_min"] = age_min
+        d["cache_size_kb"] = size_kb
+        lists.append(d)
 
     total = len(lists)
     available = sum(1 for l in lists if l["status"] == "available")
