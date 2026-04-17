@@ -18,6 +18,7 @@ DB_PATH = os.getenv("DB_PATH", "data/roteador.db")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "M3uPro@2026!")
 SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
 CACHE_TTL_HOURS = int(os.getenv("CACHE_TTL_HOURS", "6"))
+CACHE_REFRESH_MINUTES = int(os.getenv("CACHE_REFRESH_MINUTES", "60"))
 MAX_LISTS = 10
 
 admin_sessions: dict[str, datetime] = {}
@@ -81,6 +82,35 @@ def cleanup_expired_sessions():
         logger.info(f"Released {released} expired session(s)")
 
 
+async def refresh_all_caches():
+    """Busca o conteudo de todas as listas com source_url e atualiza o cache."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, name, source_url, cached_content FROM m3u_lists WHERE source_url IS NOT NULL AND source_url != ''"
+    ).fetchall()
+    conn.close()
+
+    for row in rows:
+        try:
+            async with httpx.AsyncClient(timeout=45, follow_redirects=True, headers=IPTV_HEADERS) as client:
+                resp = await client.get(row["source_url"])
+                resp.raise_for_status()
+                content = resp.text
+            if _is_valid_m3u(content):
+                c = get_db()
+                c.execute(
+                    "UPDATE m3u_lists SET cached_content=?, cached_at=? WHERE id=?",
+                    (content, datetime.now(), row["id"]),
+                )
+                c.commit()
+                c.close()
+                logger.info(f"Cache atualizado lista id={row['id']} ({len(content)} bytes)")
+            else:
+                logger.warning(f"Provedor retornou vazio no refresh da lista id={row['id']} — cache antigo mantido")
+        except Exception as exc:
+            logger.error(f"Erro no refresh da lista id={row['id']}: {exc}")
+
+
 # ---------- App lifecycle ----------
 
 scheduler = AsyncIOScheduler()
@@ -90,6 +120,8 @@ scheduler = AsyncIOScheduler()
 async def lifespan(app: FastAPI):
     init_db()
     scheduler.add_job(cleanup_expired_sessions, "interval", minutes=5)
+    scheduler.add_job(refresh_all_caches, "interval", minutes=CACHE_REFRESH_MINUTES)
+    scheduler.add_job(refresh_all_caches, "date", run_date=datetime.now() + timedelta(seconds=15))
     scheduler.start()
     logger.info("Scheduler started")
     yield
