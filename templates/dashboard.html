@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>M3U Router — Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <meta http-equiv="refresh" content="30" />
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+  <!-- Header -->
+  <header class="bg-gray-900 border-b border-gray-800 px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <span class="text-2xl">📡</span>
+      <h1 class="text-lg font-bold tracking-tight">M3U Router</h1>
+      <span class="text-xs bg-green-900 text-green-400 px-2 py-0.5 rounded-full font-medium">online</span>
+    </div>
+    <a href="/admin/logout" class="text-sm text-gray-500 hover:text-red-400 transition-colors">Sair →</a>
+  </header>
+
+  <main class="max-w-5xl mx-auto px-4 py-8 space-y-8">
+
+    <!-- Flash message -->
+    {% set msg = request.query_params.get('msg', '') %}
+    {% if msg %}
+    <div class="bg-blue-950 border border-blue-800 text-blue-300 rounded-xl px-5 py-3 text-sm flex items-center gap-2">
+      <span>✅</span> {{ msg | replace('+', ' ') }}
+    </div>
+    {% endif %}
+
+    <!-- Stats -->
+    <div class="grid grid-cols-3 gap-4">
+      <div class="bg-gray-900 border border-gray-800 rounded-2xl p-5">
+        <p class="text-gray-500 text-xs uppercase tracking-widest mb-1">Total</p>
+        <p class="text-3xl font-bold text-white">{{ total }}<span class="text-gray-600 text-lg">/{{ max_lists }}</span></p>
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-2xl p-5">
+        <p class="text-gray-500 text-xs uppercase tracking-widest mb-1">Disponíveis</p>
+        <p class="text-3xl font-bold text-green-400">{{ available }}</p>
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-2xl p-5">
+        <p class="text-gray-500 text-xs uppercase tracking-widest mb-1">Em Uso</p>
+        <p class="text-3xl font-bold text-yellow-400">{{ in_use }}</p>
+      </div>
+    </div>
+
+    <!-- Playlist URL -->
+    <div class="bg-gray-900 border border-blue-900 rounded-2xl p-5">
+      <p class="text-gray-400 text-xs uppercase tracking-widest mb-3">🔗 URL da Playlist (use no seu player)</p>
+      <div class="flex items-center gap-3">
+        <input
+          id="playlist-url"
+          type="text"
+          value="{{ playlist_url }}"
+          readonly
+          class="flex-1 bg-gray-800 text-blue-300 text-sm font-mono rounded-xl px-4 py-3 border border-gray-700 focus:outline-none"
+        />
+        <button
+          onclick="copyUrl()"
+          class="bg-blue-700 hover:bg-blue-600 text-white text-sm font-semibold px-5 py-3 rounded-xl transition-colors whitespace-nowrap"
+        >
+          Copiar
+        </button>
+      </div>
+      <p class="text-gray-600 text-xs mt-2">Timeout de sessão: {{ timeout }} minutos · Atualiza a cada 30s</p>
+    </div>
+
+    <!-- Lists table -->
+    <div class="bg-gray-900 border border-gray-800 rounded-2xl overflow-hidden">
+      <div class="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+        <h2 class="font-semibold text-white">Listas M3U</h2>
+        <div class="flex gap-2">
+          {% if in_use > 0 %}
+          <form method="post" action="/admin/release-all">
+            <button class="text-xs bg-gray-800 hover:bg-gray-700 text-yellow-400 px-3 py-1.5 rounded-lg transition-colors">
+              Liberar Todas
+            </button>
+          </form>
+          {% endif %}
+          {% if total < max_lists %}
+          <button
+            onclick="document.getElementById('add-form').classList.toggle('hidden')"
+            class="text-xs bg-blue-700 hover:bg-blue-600 text-white font-semibold px-4 py-1.5 rounded-lg transition-colors"
+          >
+            + Adicionar Lista
+          </button>
+          {% else %}
+          <span class="text-xs text-gray-500 px-3 py-1.5">Limite de {{ max_lists }} atingido</span>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- Add form (hidden by default) -->
+      <div id="add-form" class="hidden bg-gray-950 border-b border-gray-800 px-6 py-5">
+        <form method="post" action="/admin/lists/add" class="space-y-4">
+          <div>
+            <label class="block text-gray-400 text-xs font-medium mb-1.5">Nome da Lista *</label>
+            <input
+              type="text"
+              name="name"
+              required
+              placeholder="Ex: Lista Premium 1"
+              class="w-full bg-gray-800 border border-gray-700 text-white text-sm rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-gray-400 text-xs font-medium mb-1.5">URL da Lista M3U</label>
+              <input
+                type="url"
+                name="source_url"
+                placeholder="http://servidor.com/lista.m3u"
+                class="w-full bg-gray-800 border border-gray-700 text-white text-sm rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <p class="text-gray-600 text-xs mt-1">O conteúdo será buscado ao vivo</p>
+            </div>
+            <div>
+              <label class="block text-gray-400 text-xs font-medium mb-1.5">Ou Cole o Conteúdo M3U</label>
+              <textarea
+                name="content"
+                rows="3"
+                placeholder="#EXTM3U&#10;#EXTINF:-1,Canal&#10;http://..."
+                class="w-full bg-gray-800 border border-gray-700 text-white text-sm rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono resize-none"
+              ></textarea>
+            </div>
+          </div>
+          <div class="flex gap-3">
+            <button
+              type="submit"
+              class="bg-green-700 hover:bg-green-600 text-white text-sm font-semibold px-6 py-2.5 rounded-xl transition-colors"
+            >
+              Salvar Lista
+            </button>
+            <button
+              type="button"
+              onclick="document.getElementById('add-form').classList.add('hidden')"
+              class="bg-gray-800 hover:bg-gray-700 text-gray-400 text-sm px-5 py-2.5 rounded-xl transition-colors"
+            >
+              Cancelar
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Lists -->
+      {% if lists %}
+      <div class="divide-y divide-gray-800">
+        {% for l in lists %}
+        <div class="flex items-center gap-4 px-6 py-4 hover:bg-gray-800/40 transition-colors">
+          <!-- Status indicator -->
+          <div class="flex-shrink-0">
+            {% if l.status == 'available' %}
+            <span class="w-2.5 h-2.5 rounded-full bg-green-500 block"></span>
+            {% else %}
+            <span class="w-2.5 h-2.5 rounded-full bg-yellow-400 block animate-pulse"></span>
+            {% endif %}
+          </div>
+
+          <!-- Info -->
+          <div class="flex-1 min-w-0">
+            <p class="font-medium text-white text-sm truncate">{{ l.name }}</p>
+            <p class="text-gray-600 text-xs mt-0.5 truncate">
+              {% if l.source_url %}
+                🔗 {{ l.source_url }}
+              {% else %}
+                📄 Conteúdo manual
+              {% endif %}
+            </p>
+          </div>
+
+          <!-- Status badge -->
+          <div class="flex-shrink-0 text-center">
+            {% if l.status == 'available' %}
+            <span class="text-xs bg-green-950 text-green-400 border border-green-900 px-2.5 py-1 rounded-full font-medium">livre</span>
+            {% else %}
+            <div>
+              <span class="text-xs bg-yellow-950 text-yellow-400 border border-yellow-900 px-2.5 py-1 rounded-full font-medium">em uso</span>
+              {% if l.session_ip %}
+              <p class="text-gray-600 text-xs mt-1 font-mono">{{ l.session_ip }}</p>
+              {% endif %}
+            </div>
+            {% endif %}
+          </div>
+
+          <!-- Last accessed -->
+          <div class="flex-shrink-0 text-right hidden md:block">
+            {% if l.last_accessed %}
+            <p class="text-gray-600 text-xs">{{ l.last_accessed[:16] }}</p>
+            {% else %}
+            <p class="text-gray-700 text-xs">—</p>
+            {% endif %}
+          </div>
+
+          <!-- Actions -->
+          <div class="flex-shrink-0 flex gap-2">
+            {% if l.status == 'in_use' %}
+            <form method="post" action="/admin/lists/{{ l.id }}/release">
+              <button class="text-xs bg-gray-800 hover:bg-yellow-900 text-yellow-400 px-3 py-1.5 rounded-lg transition-colors" title="Liberar sessão">
+                Liberar
+              </button>
+            </form>
+            {% endif %}
+            <form method="post" action="/admin/lists/{{ l.id }}/delete"
+              onsubmit="return confirm('Remover {{ l.name }}?')">
+              <button class="text-xs bg-gray-800 hover:bg-red-900 text-red-400 px-3 py-1.5 rounded-lg transition-colors">
+                Remover
+              </button>
+            </form>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="text-center py-16 text-gray-600">
+        <p class="text-4xl mb-3">📋</p>
+        <p class="text-sm">Nenhuma lista cadastrada ainda.</p>
+        <p class="text-xs mt-1">Clique em "+ Adicionar Lista" para começar.</p>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- Access log -->
+    {% if logs %}
+    <div class="bg-gray-900 border border-gray-800 rounded-2xl overflow-hidden">
+      <div class="px-6 py-4 border-b border-gray-800">
+        <h2 class="font-semibold text-white">Log de Acessos <span class="text-gray-600 text-sm font-normal">(últimos 30)</span></h2>
+      </div>
+      <div class="divide-y divide-gray-800/60">
+        {% for log in logs %}
+        <div class="flex items-center gap-4 px-6 py-3 text-sm">
+          <span class="text-gray-600 font-mono text-xs w-36 flex-shrink-0">{{ log.timestamp[:16] }}</span>
+          <span class="font-mono text-blue-400 text-xs w-32 flex-shrink-0 truncate">{{ log.ip_address }}</span>
+          <span class="text-gray-300 flex-1 truncate">{{ log.list_name }}</span>
+          <span class="text-xs bg-gray-800 text-green-400 px-2 py-0.5 rounded-full">{{ log.action }}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+  </main>
+
+  <footer class="text-center text-gray-700 text-xs py-8">
+    M3U Router · Sessões expiram após {{ timeout }} min de inatividade
+  </footer>
+
+  <script>
+    function copyUrl() {
+      const url = document.getElementById('playlist-url').value;
+      navigator.clipboard.writeText(url).then(() => {
+        const btn = event.target;
+        btn.textContent = 'Copiado!';
+        btn.classList.replace('bg-blue-700', 'bg-green-700');
+        setTimeout(() => {
+          btn.textContent = 'Copiar';
+          btn.classList.replace('bg-green-700', 'bg-blue-700');
+        }, 2000);
+      });
+    }
+  </script>
+</body>
+</html>
