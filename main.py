@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 DATABASE_URL  = os.getenv("DATABASE_URL", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "M3uPro@2026!")
 SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT_MINUTES", "10"))
+
+if not DATABASE_URL:
+    raise RuntimeError("❌ Variável de ambiente DATABASE_URL não definida. Configure no Coolify em Environment Variables.")
 MAX_LISTS = 10
 
 admin_sessions: dict[str, datetime] = {}
