@@ -182,6 +182,10 @@ async def serve_playlist(request: Request):
     ip = get_client_ip(request)
     conn = get_db()
 
+    # Transacao exclusiva: serializa concorrencia para evitar atribuir
+    # a mesma lista a dois IPs diferentes ao mesmo tempo.
+    conn.execute("BEGIN IMMEDIATE")
+
     # Re-use existing session
     row = conn.execute(
         "SELECT * FROM m3u_lists WHERE status='in_use' AND session_ip=?", (ip,)
@@ -197,21 +201,31 @@ async def serve_playlist(request: Request):
         conn.close()
         return PlainTextResponse(content, media_type="audio/x-mpegurl")
 
-    # Assign a free list
+    # Atribuicao atomica: UPDATE com WHERE status='available' garante
+    # que apenas uma requisicao consiga marcar a lista como in_use.
     available = conn.execute(
         "SELECT * FROM m3u_lists WHERE status='available' ORDER BY RANDOM() LIMIT 1"
     ).fetchone()
 
     if not available:
+        conn.rollback()
         conn.close()
         busy = "#EXTM3U\n#EXTINF:-1,Todas as listas estao em uso. Tente novamente em alguns minutos.\nhttp://0.0.0.0\n"
         return PlainTextResponse(busy, media_type="audio/x-mpegurl", status_code=503)
 
-    conn.execute("""
+    cur = conn.execute("""
         UPDATE m3u_lists
         SET status='in_use', session_ip=?, last_accessed=?
-        WHERE id=?
+        WHERE id=? AND status='available'
     """, (ip, datetime.now(), available["id"]))
+
+    if cur.rowcount == 0:
+        # Outra requisicao pegou essa lista entre o SELECT e o UPDATE
+        conn.rollback()
+        conn.close()
+        logger.warning(f"Corrida detectada ao atribuir lista id={available['id']} para {ip}")
+        retry = "#EXTM3U\n#EXTINF:-1,Tente novamente em alguns segundos.\nhttp://0.0.0.0\n"
+        return PlainTextResponse(retry, media_type="audio/x-mpegurl", status_code=503)
     conn.execute(
         "INSERT INTO access_log (ip_address, list_id, list_name, action) VALUES (?,?,?,'assigned')",
         (ip, available["id"], available["name"]),
