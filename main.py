@@ -8,6 +8,7 @@ import sqlite3
 import httpx
 from fastapi import FastAPI, Request, Form, Cookie, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.templating import Jinja2Templates
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -129,6 +130,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="M3U Router", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 templates = Jinja2Templates(directory="templates")
 
 # ---------- Helpers ----------
@@ -209,6 +211,12 @@ async def fetch_m3u_content(row, conn=None) -> str:
 
 # ---------- Public endpoint ----------
 
+PLAYLIST_HEADERS = {
+    "Cache-Control": "public, max-age=300",
+    "Content-Disposition": 'inline; filename="playlist.m3u"',
+}
+
+
 @app.get("/playlist.m3u", response_class=PlainTextResponse)
 async def serve_playlist(request: Request):
     ip = get_client_ip(request)
@@ -231,7 +239,7 @@ async def serve_playlist(request: Request):
         conn.commit()
         content = await fetch_m3u_content(row, conn)
         conn.close()
-        return PlainTextResponse(content, media_type="audio/x-mpegurl")
+        return PlainTextResponse(content, media_type="audio/x-mpegurl", headers=PLAYLIST_HEADERS)
 
     # Atribuicao atomica: UPDATE com WHERE status='available' garante
     # que apenas uma requisicao consiga marcar a lista como in_use.
@@ -266,7 +274,7 @@ async def serve_playlist(request: Request):
     content = await fetch_m3u_content(available)
     conn.close()
     logger.info(f"List '{available['name']}' assigned to {ip}")
-    return PlainTextResponse(content, media_type="audio/x-mpegurl")
+    return PlainTextResponse(content, media_type="audio/x-mpegurl", headers=PLAYLIST_HEADERS)
 
 
 # ---------- Admin: auth ----------
