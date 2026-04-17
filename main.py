@@ -146,13 +146,23 @@ def is_admin(token: str | None) -> bool:
     return True
 
 
+IPTV_HEADERS = {
+    "User-Agent": "IPTV Smarters/1.0 (Linux; Android 9)",
+    "Accept": "*/*",
+    "Connection": "keep-alive",
+}
+
 async def fetch_raw_m3u(row: dict) -> str:
     if row.get("source_url"):
         try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=IPTV_HEADERS) as client:
                 resp = await client.get(row["source_url"])
                 resp.raise_for_status()
-                return resp.text
+                content = resp.text.strip()
+                if content:
+                    return content
+                logger.warning(f"M3U vazio recebido de: {row['source_url']}")
+                return "#EXTM3U\n#EXTINF:-1,Lista retornou vazia\nhttp://0.0.0.0\n"
         except Exception as exc:
             logger.error(f"Erro ao buscar M3U: {exc}")
             return "#EXTM3U\n#EXTINF:-1,Erro ao buscar lista\nhttp://0.0.0.0\n"
