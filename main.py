@@ -472,19 +472,28 @@ async def fetch_m3u_gzip(row, conn=None) -> bytes:
         return _gz(f"#EXTM3U\n#EXTINF:-1,Erro: {exc}\nhttp://0.0.0.0\n")
 
 
-def playlist_response(blob: bytes, accept_encoding: str, status_code: int = 200) -> Response:
+FORCE_GZIP = os.getenv("FORCE_GZIP", "1") == "1"
+
+
+def playlist_response(blob: bytes, accept_encoding: str, user_agent: str = "", status_code: int = 200) -> Response:
     headers = {**PLAYLIST_HEADERS}
-    if "gzip" in (accept_encoding or "").lower():
+    accepts_gzip = "gzip" in (accept_encoding or "").lower()
+    # Varios players (Ibo, Smarters, VLC) suportam gzip mesmo sem
+    # anunciar Accept-Encoding. Servimos gzip por padrao pois reduz
+    # a resposta em ~10x — muito mais rapido em smart TVs.
+    if accepts_gzip or FORCE_GZIP:
         headers["Content-Encoding"] = "gzip"
+        headers["Content-Length"] = str(len(blob))
         return Response(
             content=blob,
             media_type="audio/x-mpegurl",
             headers=headers,
             status_code=status_code,
         )
-    # Cliente nao aceita gzip — descompacta
+    raw = gzip.decompress(blob)
+    headers["Content-Length"] = str(len(raw))
     return Response(
-        content=gzip.decompress(blob),
+        content=raw,
         media_type="audio/x-mpegurl",
         headers=headers,
         status_code=status_code,
