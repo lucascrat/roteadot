@@ -195,6 +195,9 @@
           <div class="flex-shrink-0 text-center">
             {% if l.status == 'available' %}
             <span class="text-xs bg-green-950 text-green-400 border border-green-900 px-2.5 py-1 rounded-full font-medium">livre</span>
+            {% if l.last_active_cons is not none %}
+              <p class="text-gray-500 text-xs mt-1">probe: {{ l.last_active_cons }} ativa(s){% if l.probe_age_sec is not none %} · {{ l.probe_age_sec }}s{% endif %}</p>
+            {% endif %}
             {% else %}
             <div>
               <span class="text-xs bg-yellow-950 text-yellow-400 border border-yellow-900 px-2.5 py-1 rounded-full font-medium">em uso</span>
@@ -203,9 +206,9 @@
               {% endif %}
               {% if l.last_active_cons is not none %}
                 {% if l.last_active_cons > 0 %}
-                <p class="text-green-500 text-xs mt-1">{{ l.last_active_cons }} ativa(s)</p>
+                <p class="text-green-500 text-xs mt-1">{{ l.last_active_cons }} ativa(s){% if l.probe_age_sec is not none %} · {{ l.probe_age_sec }}s{% endif %}</p>
                 {% else %}
-                <p class="text-red-400 text-xs mt-1">zero ({{ l.zero_streak or 0 }}/3)</p>
+                <p class="text-red-400 text-xs mt-1">zero ({{ l.zero_streak or 0 }}/3){% if l.probe_age_sec is not none %} · {{ l.probe_age_sec }}s{% endif %}</p>
                 {% endif %}
               {% endif %}
             </div>

@@ -43,8 +43,11 @@ admin_sessions: dict[str, datetime] = {}
 
 def get_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -92,9 +95,25 @@ def init_db():
         conn.execute("ALTER TABLE m3u_lists ADD COLUMN last_probe_at TIMESTAMP")
     # Libera espaco do cache antigo em texto
     conn.execute("UPDATE m3u_lists SET cached_content=NULL WHERE cached_content IS NOT NULL")
+    # Indices
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_lists_status ON m3u_lists(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_lists_session_ip ON m3u_lists(session_ip)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_log_timestamp ON access_log(timestamp)")
     conn.commit()
     conn.close()
     logger.info("Database initialised")
+
+
+def prune_access_log():
+    conn = get_db()
+    cur = conn.execute(
+        "DELETE FROM access_log WHERE timestamp < datetime('now', '-30 days')"
+    )
+    removed = cur.rowcount
+    conn.commit()
+    conn.close()
+    if removed:
+        logger.info(f"Podados {removed} registros antigos de access_log")
 
 
 ZERO_STREAK_TO_RELEASE = int(os.getenv("ZERO_STREAK_TO_RELEASE", "2"))
@@ -124,13 +143,18 @@ async def probe_provider(username: str, password: str) -> dict:
     return {"ok": True, "active": active, "raw": user_info, "url": url}
 
 
-async def check_active_connections():
-    """Consulta player_api.php por lista e libera so apos N checagens zeradas.
+PROBE_CONCURRENCY = int(os.getenv("PROBE_CONCURRENCY", "5"))
 
-    Exige ZERO_STREAK_TO_RELEASE ciclos consecutivos com active_cons=0
-    antes de liberar, evitando falso negativo quando o player esta
-    apenas trocando de canal.
+
+async def check_active_connections():
+    """Consulta player_api.php em paralelo e aplica transicoes.
+
+    - Lista 'available' com active_cons > 0 vira 'in_use' (session_ip=NULL)
+      para ser reivindicada pelo primeiro IP que chamar /playlist.m3u.
+    - Lista 'in_use' so libera apos ZERO_STREAK_TO_RELEASE checagens
+      consecutivas com active_cons=0.
     """
+    import asyncio
     conn = get_db()
     rows = conn.execute(
         "SELECT id, name, status, username, password, session_ip, last_accessed, zero_streak "
@@ -141,116 +165,106 @@ async def check_active_connections():
     if not rows:
         return
 
+    sem = asyncio.Semaphore(PROBE_CONCURRENCY)
+
+    async def probe_with_sem(r):
+        async with sem:
+            return r, await probe_provider(r["username"], r["password"])
+
+    results = await asyncio.gather(*(probe_with_sem(r) for r in rows))
+
     now = datetime.now()
-    for row in rows:
-        result = await probe_provider(row["username"], row["password"])
+    conn = get_db()
+    try:
+        for row, result in results:
+            if row["status"] == "available":
+                if result["ok"] and (result["active"] or 0) > 0:
+                    cur = conn.execute(
+                        "UPDATE m3u_lists SET status='in_use', session_ip=NULL, "
+                        "last_accessed=?, last_active_cons=?, zero_streak=0, last_probe_at=? "
+                        "WHERE id=? AND status='available'",
+                        (now, result["active"], now, row["id"]),
+                    )
+                    if cur.rowcount:
+                        conn.execute(
+                            "INSERT INTO access_log (ip_address, list_id, list_name, action) "
+                            "VALUES (?,?,?,'auto_assigned')",
+                            (None, row["id"], row["name"]),
+                        )
+                        logger.info(f"Lista id={row['id']} auto-atribuida (active_cons={result['active']})")
+                elif result["ok"]:
+                    conn.execute(
+                        "UPDATE m3u_lists SET last_active_cons=?, last_probe_at=? WHERE id=?",
+                        (result["active"], now, row["id"]),
+                    )
+                continue
 
-        # Re-atribui lista AVAILABLE se o provedor diz que tem conexao ativa.
-        # Cobre o caso do player (Ibo) reabrir e usar playlist em cache sem
-        # bater em /playlist.m3u.
-        if row["status"] == "available":
-            if result["ok"] and result["active"] and result["active"] > 0:
-                c = get_db()
-                c.execute(
-                    "UPDATE m3u_lists SET status='in_use', session_ip=?, "
-                    "last_accessed=?, last_active_cons=?, zero_streak=0, last_probe_at=? "
-                    "WHERE id=? AND status='available'",
-                    ("auto-detectado", now, result["active"], now, row["id"]),
+            # status == 'in_use'
+            if not result["ok"]:
+                conn.execute(
+                    "UPDATE m3u_lists SET last_probe_at=? WHERE id=?",
+                    (now, row["id"]),
                 )
-                c.execute(
-                    "INSERT INTO access_log (ip_address, list_id, list_name, action) "
-                    "VALUES (?,?,?,'auto_assigned')",
-                    ("auto-detectado", row["id"], row["name"]),
-                )
-                c.commit()
-                c.close()
-                logger.info(f"Lista id={row['id']} re-atribuida automaticamente (active_cons={result['active']})")
-            elif result["ok"]:
-                c = get_db()
-                c.execute(
-                    "UPDATE m3u_lists SET last_active_cons=?, last_probe_at=? WHERE id=?",
-                    (result["active"], now, row["id"]),
-                )
-                c.commit()
-                c.close()
-            continue
+                logger.warning(f"player_api falhou lista id={row['id']}: {result.get('error')} — mantendo sessao")
+                continue
 
-        c = get_db()
-        if not result["ok"]:
-            c.execute(
-                "UPDATE m3u_lists SET last_probe_at=? WHERE id=?",
+            active = result["active"]
+            if active > 0:
+                conn.execute(
+                    "UPDATE m3u_lists SET last_accessed=?, last_active_cons=?, "
+                    "zero_streak=0, last_probe_at=? WHERE id=? AND status='in_use'",
+                    (now, active, now, row["id"]),
+                )
+                continue
+
+            # active == 0
+            last = row["last_accessed"]
+            try:
+                ts = last if isinstance(last, datetime) else datetime.fromisoformat(str(last))
+                idle_sec = (now - ts).total_seconds()
+            except Exception:
+                idle_sec = 9999
+            if idle_sec < 60:
+                conn.execute(
+                    "UPDATE m3u_lists SET last_active_cons=0, last_probe_at=? WHERE id=?",
+                    (now, row["id"]),
+                )
+                continue
+
+            streak = (row["zero_streak"] or 0) + 1
+            if streak < ZERO_STREAK_TO_RELEASE:
+                conn.execute(
+                    "UPDATE m3u_lists SET zero_streak=?, last_active_cons=0, last_probe_at=? WHERE id=?",
+                    (streak, now, row["id"]),
+                )
+                continue
+
+            conn.execute(
+                "UPDATE m3u_lists SET status='available', session_ip=NULL, last_accessed=NULL, "
+                "zero_streak=0, last_active_cons=0, last_probe_at=? "
+                "WHERE id=? AND status='in_use'",
                 (now, row["id"]),
             )
-            c.commit()
-            c.close()
-            logger.warning(f"player_api falhou lista id={row['id']}: {result.get('error')} — mantendo sessao")
-            continue
-
-        active = result["active"]
-        if active > 0:
-            c.execute(
-                "UPDATE m3u_lists SET last_accessed=?, last_active_cons=?, "
-                "zero_streak=0, last_probe_at=? WHERE id=? AND status='in_use'",
-                (now, active, now, row["id"]),
+            conn.execute(
+                "INSERT INTO access_log (ip_address, list_id, list_name, action) "
+                "VALUES (?,?,?,'released_no_conn')",
+                (row["session_ip"], row["id"], row["name"]),
             )
-            c.commit()
-            c.close()
-            logger.info(f"Lista id={row['id']} ativa (active_cons={active})")
-            continue
-
-        # active == 0
-        last = row["last_accessed"]
-        try:
-            ts = last if isinstance(last, datetime) else datetime.fromisoformat(str(last))
-            idle_sec = (now - ts).total_seconds()
-        except Exception:
-            idle_sec = 9999
-        if idle_sec < 60:
-            c.execute(
-                "UPDATE m3u_lists SET last_active_cons=0, last_probe_at=? WHERE id=?",
-                (now, row["id"]),
-            )
-            c.commit()
-            c.close()
-            logger.info(f"Lista id={row['id']} zero mas recem-atribuida ({idle_sec:.0f}s)")
-            continue
-
-        streak = (row["zero_streak"] or 0) + 1
-        if streak < ZERO_STREAK_TO_RELEASE:
-            c.execute(
-                "UPDATE m3u_lists SET zero_streak=?, last_active_cons=0, last_probe_at=? WHERE id=?",
-                (streak, now, row["id"]),
-            )
-            c.commit()
-            c.close()
-            logger.info(f"Lista id={row['id']} zero ({streak}/{ZERO_STREAK_TO_RELEASE}) — aguardando confirmacao")
-            continue
-
-        c.execute(
-            "UPDATE m3u_lists SET status='available', session_ip=NULL, last_accessed=NULL, "
-            "zero_streak=0, last_active_cons=0, last_probe_at=? "
-            "WHERE id=? AND status='in_use'",
-            (now, row["id"]),
-        )
-        c.execute(
-            "INSERT INTO access_log (ip_address, list_id, list_name, action) "
-            "VALUES (?,?,?,'released_no_conn')",
-            (row["session_ip"], row["id"], row["name"]),
-        )
-        c.commit()
-        c.close()
-        logger.info(f"Lista id={row['id']} liberada ({streak} checagens zeradas, idle={idle_sec:.0f}s)")
+            logger.info(f"Lista id={row['id']} liberada ({streak} checagens zeradas, idle={idle_sec:.0f}s)")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def cleanup_expired_sessions():
     conn = get_db()
     threshold = datetime.now() - timedelta(minutes=SESSION_TIMEOUT)
-    conn.execute("""
+    cur = conn.execute("""
         UPDATE m3u_lists
         SET status='available', session_ip=NULL, last_accessed=NULL
         WHERE status='in_use' AND last_accessed < ?
     """, (threshold,))
-    released = conn.total_changes
+    released = cur.rowcount
     conn.commit()
     conn.close()
     if released:
@@ -265,18 +279,39 @@ def _gunz(blob: bytes) -> str:
     return gzip.decompress(blob).decode("utf-8")
 
 
-def rewrite_credentials(template: str, from_user: str, from_pass: str, to_user: str, to_pass: str) -> str:
-    """Substitui credenciais Xtream dentro do conteudo M3U.
+def _cred_variants(value: str) -> list[str]:
+    """Retorna formas que o provedor pode usar no M3U (crua e url-encoded)."""
+    from urllib.parse import quote, unquote
+    variants = {value, quote(value, safe=""), unquote(value)}
+    # Mais longas primeiro para evitar substituicao parcial
+    return sorted((v for v in variants if v), key=len, reverse=True)
 
-    Cobre tanto o formato de querystring (?username=...&password=...)
-    quanto o formato de path (/live/USER/PASS/123.ts).
+
+def rewrite_credentials(template: str, from_user: str, from_pass: str, to_user: str, to_pass: str) -> str:
+    """Substitui credenciais Xtream no M3U.
+
+    Cobre querystring (?username=...&password=...) e path (/USER/PASS/),
+    em formas crua e url-encoded, com placeholders para evitar que a
+    substituicao de username pegue pedacos da password.
     """
+    import re
+    from urllib.parse import quote
     out = template
-    # Querystring
-    out = out.replace(f"username={from_user}", f"username={to_user}")
-    out = out.replace(f"password={from_pass}", f"password={to_pass}")
-    # Path-style: /USER/PASS/  (precisa de dois replaces posicionais)
-    out = out.replace(f"/{from_user}/{from_pass}/", f"/{to_user}/{to_pass}/")
+    U_PH = "\x00U_PLACEHOLDER\x00"
+    P_PH = "\x00P_PLACEHOLDER\x00"
+
+    for u in _cred_variants(from_user):
+        out = re.sub(rf"username={re.escape(u)}\b", f"username={U_PH}", out)
+    for p in _cred_variants(from_pass):
+        out = re.sub(rf"password={re.escape(p)}\b", f"password={P_PH}", out)
+
+    # Path style: /USER/PASS/
+    for u in _cred_variants(from_user):
+        for p in _cred_variants(from_pass):
+            out = out.replace(f"/{u}/{p}/", f"/{U_PH}/{P_PH}/")
+
+    out = out.replace(U_PH, quote(to_user, safe=""))
+    out = out.replace(P_PH, quote(to_pass, safe=""))
     return out
 
 
@@ -378,6 +413,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(check_active_connections, "interval", seconds=ACTIVE_CHECK_SECONDS, max_instances=1)
     scheduler.add_job(refresh_all_caches, "interval", minutes=CACHE_REFRESH_MINUTES)
     scheduler.add_job(refresh_all_caches, "date", run_date=datetime.now() + timedelta(seconds=15))
+    scheduler.add_job(prune_access_log, "interval", hours=24)
     scheduler.start()
     logger.info("Scheduler started")
     yield
@@ -444,12 +480,15 @@ async def fetch_m3u_gzip(row, conn=None) -> bytes:
         except Exception:
             pass
 
+    import time
+    t0 = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=IPTV_HEADERS) as client:
             resp = await client.get(row["source_url"])
             resp.raise_for_status()
             content = resp.text
-            logger.info(f"Buscou {len(content)} bytes de {row['source_url']}")
+            fetch_ms = (time.perf_counter() - t0) * 1000
+            logger.info(f"Buscou {len(content)} bytes de {row['source_url']} em {fetch_ms:.0f}ms")
             if _is_valid_m3u(content):
                 blob = _gz(content)
                 if conn is not None:
@@ -502,72 +541,108 @@ def playlist_response(blob: bytes, accept_encoding: str, user_agent: str = "", s
 # ---------- Public endpoint ----------
 
 
+@app.get("/health")
+async def health():
+    try:
+        conn = get_db()
+        conn.execute("SELECT 1").fetchone()
+        conn.close()
+        return {"ok": True}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
 @app.get("/playlist.m3u", response_class=PlainTextResponse)
 async def serve_playlist(request: Request):
     import time
     t0 = time.perf_counter()
     ip = get_client_ip(request)
-    conn = get_db()
-
-    def _log_timing(tag: str, size: int):
-        ms = (time.perf_counter() - t0) * 1000
-        logger.info(f"/playlist.m3u [{tag}] ip={ip} bytes={size} tempo={ms:.0f}ms")
-
-    # Transacao exclusiva: serializa concorrencia para evitar atribuir
-    # a mesma lista a dois IPs diferentes ao mesmo tempo.
-    conn.execute("BEGIN IMMEDIATE")
-
-    # Re-use existing session
-    row = conn.execute(
-        "SELECT * FROM m3u_lists WHERE status='in_use' AND session_ip=?", (ip,)
-    ).fetchone()
-
+    ua = request.headers.get("user-agent", "")
     accept_enc = request.headers.get("accept-encoding", "")
 
-    if row:
-        conn.execute(
-            "UPDATE m3u_lists SET last_accessed=? WHERE id=?",
-            (datetime.now(), row["id"]),
-        )
-        conn.commit()
-        blob = await fetch_m3u_gzip(row, conn)
+    def _log_timing(tag: str, size: int, fetch_ms: float | None = None):
+        ms = (time.perf_counter() - t0) * 1000
+        extra = f" fetch={fetch_ms:.0f}ms" if fetch_ms is not None else ""
+        logger.info(f"/playlist.m3u [{tag}] ip={ip} ua={ua[:40]!r} bytes={size} total={ms:.0f}ms{extra}")
+
+    conn = get_db()
+    row = None
+    tag = None
+    try:
+        # Transacao curta: so atribuicao, sem fetch HTTP dentro.
+        conn.execute("BEGIN IMMEDIATE")
+
+        # 1) Reuso por IP
+        row = conn.execute(
+            "SELECT * FROM m3u_lists WHERE status='in_use' AND session_ip=?", (ip,)
+        ).fetchone()
+
+        if row:
+            conn.execute(
+                "UPDATE m3u_lists SET last_accessed=? WHERE id=?",
+                (datetime.now(), row["id"]),
+            )
+            conn.commit()
+            tag = "reuse"
+        else:
+            # 2) Reivindica lista auto-atribuida (session_ip IS NULL)
+            orphan = conn.execute(
+                "SELECT * FROM m3u_lists WHERE status='in_use' AND session_ip IS NULL LIMIT 1"
+            ).fetchone()
+            if orphan:
+                cur = conn.execute(
+                    "UPDATE m3u_lists SET session_ip=?, last_accessed=? "
+                    "WHERE id=? AND status='in_use' AND session_ip IS NULL",
+                    (ip, datetime.now(), orphan["id"]),
+                )
+                if cur.rowcount:
+                    conn.execute(
+                        "INSERT INTO access_log (ip_address, list_id, list_name, action) VALUES (?,?,?,'claimed')",
+                        (ip, orphan["id"], orphan["name"]),
+                    )
+                    conn.commit()
+                    row = orphan
+                    tag = "claim"
+
+            if row is None:
+                # 3) Atribuicao atomica de lista available
+                available = conn.execute(
+                    "SELECT * FROM m3u_lists WHERE status='available' ORDER BY RANDOM() LIMIT 1"
+                ).fetchone()
+                if not available:
+                    conn.rollback()
+                    busy = _gz("#EXTM3U\n#EXTINF:-1,Todas as listas estao em uso. Tente novamente em alguns minutos.\nhttp://0.0.0.0\n")
+                    return playlist_response(busy, accept_enc, status_code=503)
+                cur = conn.execute("""
+                    UPDATE m3u_lists
+                    SET status='in_use', session_ip=?, last_accessed=?, zero_streak=0, last_active_cons=NULL
+                    WHERE id=? AND status='available'
+                """, (ip, datetime.now(), available["id"]))
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    logger.warning(f"Corrida ao atribuir lista id={available['id']} para {ip}")
+                    retry = _gz("#EXTM3U\n#EXTINF:-1,Tente novamente em alguns segundos.\nhttp://0.0.0.0\n")
+                    return playlist_response(retry, accept_enc, status_code=503)
+                conn.execute(
+                    "INSERT INTO access_log (ip_address, list_id, list_name, action) VALUES (?,?,?,'assigned')",
+                    (ip, available["id"], available["name"]),
+                )
+                conn.commit()
+                row = available
+                tag = "assign"
+                logger.info(f"List '{available['name']}' assigned to {ip}")
+    finally:
         conn.close()
-        _log_timing("reuse", len(blob))
-        return playlist_response(blob, accept_enc)
 
-    # Atribuicao atomica: UPDATE com WHERE status='available' garante
-    # que apenas uma requisicao consiga marcar a lista como in_use.
-    available = conn.execute(
-        "SELECT * FROM m3u_lists WHERE status='available' ORDER BY RANDOM() LIMIT 1"
-    ).fetchone()
-
-    if not available:
-        conn.rollback()
-        conn.close()
-        busy = _gz("#EXTM3U\n#EXTINF:-1,Todas as listas estao em uso. Tente novamente em alguns minutos.\nhttp://0.0.0.0\n")
-        return playlist_response(busy, accept_enc, status_code=503)
-
-    cur = conn.execute("""
-        UPDATE m3u_lists
-        SET status='in_use', session_ip=?, last_accessed=?, zero_streak=0, last_active_cons=NULL
-        WHERE id=? AND status='available'
-    """, (ip, datetime.now(), available["id"]))
-
-    if cur.rowcount == 0:
-        conn.rollback()
-        conn.close()
-        logger.warning(f"Corrida detectada ao atribuir lista id={available['id']} para {ip}")
-        retry = _gz("#EXTM3U\n#EXTINF:-1,Tente novamente em alguns segundos.\nhttp://0.0.0.0\n")
-        return playlist_response(retry, accept_enc, status_code=503)
-    conn.execute(
-        "INSERT INTO access_log (ip_address, list_id, list_name, action) VALUES (?,?,?,'assigned')",
-        (ip, available["id"], available["name"]),
-    )
-    conn.commit()
-    blob = await fetch_m3u_gzip(available)
-    conn.close()
-    logger.info(f"List '{available['name']}' assigned to {ip}")
-    _log_timing("assign", len(blob))
+    # Fetch FORA da transacao — cache miss nao trava outros IPs.
+    fetch_t0 = time.perf_counter()
+    conn2 = get_db()
+    try:
+        blob = await fetch_m3u_gzip(row, conn2)
+    finally:
+        conn2.close()
+    fetch_ms = (time.perf_counter() - fetch_t0) * 1000
+    _log_timing(tag, len(blob), fetch_ms)
     return playlist_response(blob, accept_enc)
 
 
@@ -631,6 +706,16 @@ async def dashboard(request: Request, admin_token: str = Cookie(default=None)):
             size_kb = len(d["cached_gzip"]) // 1024
         d["cache_age_min"] = age_min
         d["cache_size_kb"] = size_kb
+
+        probe_at = d.get("last_probe_at")
+        probe_age_sec = None
+        if probe_at:
+            try:
+                ts = probe_at if isinstance(probe_at, datetime) else datetime.fromisoformat(str(probe_at))
+                probe_age_sec = int((now_dt - ts).total_seconds())
+            except Exception:
+                pass
+        d["probe_age_sec"] = probe_age_sec
         lists.append(d)
 
     total = len(lists)
