@@ -20,7 +20,7 @@ DB_PATH = os.getenv("DB_PATH", "data/roteador.db")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "M3uPro@2026!")
 SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT_MINUTES", "10"))
 CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "1"))
-ACTIVE_CHECK_SECONDS = int(os.getenv("ACTIVE_CHECK_SECONDS", "45"))
+ACTIVE_CHECK_SECONDS = int(os.getenv("ACTIVE_CHECK_SECONDS", "30"))
 PROVIDER_API_BASE = os.getenv(
     "PROVIDER_API_BASE",
     "http://gfbegin.top:8880/player_api.php?username={username}&password={password}",
@@ -98,7 +98,7 @@ def init_db():
     logger.info("Database initialised")
 
 
-ZERO_STREAK_TO_RELEASE = int(os.getenv("ZERO_STREAK_TO_RELEASE", "3"))
+ZERO_STREAK_TO_RELEASE = int(os.getenv("ZERO_STREAK_TO_RELEASE", "2"))
 
 
 async def probe_provider(username: str, password: str) -> dict:
