@@ -85,6 +85,12 @@ def init_db():
         conn.execute("ALTER TABLE m3u_lists ADD COLUMN password TEXT")
     if "cached_gzip" not in existing:
         conn.execute("ALTER TABLE m3u_lists ADD COLUMN cached_gzip BLOB")
+    if "last_active_cons" not in existing:
+        conn.execute("ALTER TABLE m3u_lists ADD COLUMN last_active_cons INTEGER")
+    if "zero_streak" not in existing:
+        conn.execute("ALTER TABLE m3u_lists ADD COLUMN zero_streak INTEGER DEFAULT 0")
+    if "last_probe_at" not in existing:
+        conn.execute("ALTER TABLE m3u_lists ADD COLUMN last_probe_at TIMESTAMP")
     # Libera espaco do cache antigo em texto
     conn.execute("UPDATE m3u_lists SET cached_content=NULL WHERE cached_content IS NOT NULL")
     conn.commit()
@@ -92,19 +98,43 @@ def init_db():
     logger.info("Database initialised")
 
 
-async def check_active_connections():
-    """Pergunta ao provedor Xtream quantas conexoes estao ativas por credencial.
+ZERO_STREAK_TO_RELEASE = int(os.getenv("ZERO_STREAK_TO_RELEASE", "3"))
 
-    - active_cons > 0: usuario ainda assistindo -> atualiza last_accessed
-    - active_cons == 0: ninguem conectado -> libera a lista imediatamente
 
-    Isso torna a deteccao de "logado/deslogado" quase imediata,
-    independente do timeout fixo.
-    """
+async def probe_provider(username: str, password: str) -> dict:
+    """Chama player_api.php e retorna dict com 'ok', 'active', 'raw'."""
     from urllib.parse import quote
+    url = PROVIDER_API_BASE.format(
+        username=quote(username, safe=""),
+        password=quote(password, safe=""),
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True, headers=IPTV_HEADERS) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "active": None, "raw": None, "url": url}
+
+    user_info = data.get("user_info", {}) if isinstance(data, dict) else {}
+    active_raw = user_info.get("active_cons", 0)
+    try:
+        active = int(active_raw)
+    except (TypeError, ValueError):
+        active = 0
+    return {"ok": True, "active": active, "raw": user_info, "url": url}
+
+
+async def check_active_connections():
+    """Consulta player_api.php por lista e libera so apos N checagens zeradas.
+
+    Exige ZERO_STREAK_TO_RELEASE ciclos consecutivos com active_cons=0
+    antes de liberar, evitando falso negativo quando o player esta
+    apenas trocando de canal.
+    """
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, name, username, password, session_ip, last_accessed "
+        "SELECT id, name, username, password, session_ip, last_accessed, zero_streak "
         "FROM m3u_lists WHERE status='in_use' AND username IS NOT NULL AND password IS NOT NULL"
     ).fetchall()
     conn.close()
@@ -112,61 +142,75 @@ async def check_active_connections():
     if not rows:
         return
 
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True, headers=IPTV_HEADERS) as client:
-        for row in rows:
-            url = PROVIDER_API_BASE.format(
-                username=quote(row["username"], safe=""),
-                password=quote(row["password"], safe=""),
-            )
-            try:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                data = resp.json()
-                user_info = data.get("user_info", {}) if isinstance(data, dict) else {}
-                active_raw = user_info.get("active_cons", 0)
-                try:
-                    active = int(active_raw)
-                except (TypeError, ValueError):
-                    active = 0
-            except Exception as exc:
-                logger.warning(f"player_api falhou lista id={row['id']}: {exc} — mantendo sessao")
-                continue
+    now = datetime.now()
+    for row in rows:
+        result = await probe_provider(row["username"], row["password"])
 
-            c = get_db()
-            if active > 0:
-                c.execute(
-                    "UPDATE m3u_lists SET last_accessed=? WHERE id=? AND status='in_use'",
-                    (datetime.now(), row["id"]),
-                )
-                c.commit()
-                c.close()
-                logger.info(f"Lista id={row['id']} ativa no provedor (active_cons={active})")
-            else:
-                # Confirma que esta sem conexao ha pelo menos uns segundos
-                # para evitar corrida entre player abrindo stream e API.
-                last = row["last_accessed"]
-                try:
-                    ts = last if isinstance(last, datetime) else datetime.fromisoformat(str(last))
-                    idle_sec = (datetime.now() - ts).total_seconds()
-                except Exception:
-                    idle_sec = 9999
-                if idle_sec < 60:
-                    c.close()
-                    logger.info(f"Lista id={row['id']} sem conexao mas recem-atribuida ({idle_sec:.0f}s) — aguardando")
-                    continue
-                c.execute(
-                    "UPDATE m3u_lists SET status='available', session_ip=NULL, last_accessed=NULL "
-                    "WHERE id=? AND status='in_use'",
-                    (row["id"],),
-                )
-                c.execute(
-                    "INSERT INTO access_log (ip_address, list_id, list_name, action) "
-                    "VALUES (?,?,?,'released_no_conn')",
-                    (row["session_ip"], row["id"], row["name"]),
-                )
-                c.commit()
-                c.close()
-                logger.info(f"Lista id={row['id']} liberada (active_cons=0, idle={idle_sec:.0f}s)")
+        c = get_db()
+        if not result["ok"]:
+            c.execute(
+                "UPDATE m3u_lists SET last_probe_at=? WHERE id=?",
+                (now, row["id"]),
+            )
+            c.commit()
+            c.close()
+            logger.warning(f"player_api falhou lista id={row['id']}: {result.get('error')} — mantendo sessao")
+            continue
+
+        active = result["active"]
+        if active > 0:
+            c.execute(
+                "UPDATE m3u_lists SET last_accessed=?, last_active_cons=?, "
+                "zero_streak=0, last_probe_at=? WHERE id=? AND status='in_use'",
+                (now, active, now, row["id"]),
+            )
+            c.commit()
+            c.close()
+            logger.info(f"Lista id={row['id']} ativa (active_cons={active})")
+            continue
+
+        # active == 0
+        last = row["last_accessed"]
+        try:
+            ts = last if isinstance(last, datetime) else datetime.fromisoformat(str(last))
+            idle_sec = (now - ts).total_seconds()
+        except Exception:
+            idle_sec = 9999
+        if idle_sec < 60:
+            c.execute(
+                "UPDATE m3u_lists SET last_active_cons=0, last_probe_at=? WHERE id=?",
+                (now, row["id"]),
+            )
+            c.commit()
+            c.close()
+            logger.info(f"Lista id={row['id']} zero mas recem-atribuida ({idle_sec:.0f}s)")
+            continue
+
+        streak = (row["zero_streak"] or 0) + 1
+        if streak < ZERO_STREAK_TO_RELEASE:
+            c.execute(
+                "UPDATE m3u_lists SET zero_streak=?, last_active_cons=0, last_probe_at=? WHERE id=?",
+                (streak, now, row["id"]),
+            )
+            c.commit()
+            c.close()
+            logger.info(f"Lista id={row['id']} zero ({streak}/{ZERO_STREAK_TO_RELEASE}) — aguardando confirmacao")
+            continue
+
+        c.execute(
+            "UPDATE m3u_lists SET status='available', session_ip=NULL, last_accessed=NULL, "
+            "zero_streak=0, last_active_cons=0, last_probe_at=? "
+            "WHERE id=? AND status='in_use'",
+            (now, row["id"]),
+        )
+        c.execute(
+            "INSERT INTO access_log (ip_address, list_id, list_name, action) "
+            "VALUES (?,?,?,'released_no_conn')",
+            (row["session_ip"], row["id"], row["name"]),
+        )
+        c.commit()
+        c.close()
+        logger.info(f"Lista id={row['id']} liberada ({streak} checagens zeradas, idle={idle_sec:.0f}s)")
 
 
 def cleanup_expired_sessions():
@@ -467,7 +511,7 @@ async def serve_playlist(request: Request):
 
     cur = conn.execute("""
         UPDATE m3u_lists
-        SET status='in_use', session_ip=?, last_accessed=?
+        SET status='in_use', session_ip=?, last_accessed=?, zero_streak=0, last_active_cons=NULL
         WHERE id=? AND status='available'
     """, (ip, datetime.now(), available["id"]))
 
@@ -641,6 +685,30 @@ async def delete_list(list_id: int, admin_token: str = Cookie(default=None)):
     conn.commit()
     conn.close()
     return RedirectResponse("/admin?msg=Lista+removida", status_code=302)
+
+
+@app.get("/admin/probe")
+async def admin_probe(admin_token: str = Cookie(default=None)):
+    if not is_admin(admin_token):
+        return RedirectResponse("/admin/login", status_code=302)
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, name, username, password FROM m3u_lists WHERE username IS NOT NULL AND password IS NOT NULL"
+    ).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        result = await probe_provider(r["username"], r["password"])
+        out.append({
+            "id": r["id"],
+            "name": r["name"],
+            "ok": result["ok"],
+            "active_cons": result.get("active"),
+            "error": result.get("error"),
+            "url": result.get("url"),
+            "user_info": result.get("raw"),
+        })
+    return out
 
 
 @app.post("/admin/release-all")

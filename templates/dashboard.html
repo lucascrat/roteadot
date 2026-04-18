@@ -205,6 +205,13 @@
               {% if l.session_ip %}
               <p class="text-gray-600 text-xs mt-1 font-mono">{{ l.session_ip }}</p>
               {% endif %}
+              {% if l.last_active_cons is not none %}
+                {% if l.last_active_cons > 0 %}
+                <p class="text-green-500 text-xs mt-1">{{ l.last_active_cons }} ativa(s)</p>
+                {% else %}
+                <p class="text-red-400 text-xs mt-1">zero ({{ l.zero_streak or 0 }}/3)</p>
+                {% endif %}
+              {% endif %}
             </div>
             {% endif %}
           </div>
