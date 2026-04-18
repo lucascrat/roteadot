@@ -31,7 +31,6 @@ PROVIDER_BASE = os.getenv(
     "PROVIDER_BASE",
     "http://gfbegin.top:8880/get.php?username={username}&password={password}&type=m3u_plus&output=m3u8",
 )
-MAX_LISTS = 10
 
 
 def build_provider_url(username: str, password: str) -> str:
@@ -649,7 +648,6 @@ async def dashboard(request: Request, admin_token: str = Cookie(default=None)):
         "total": total,
         "available": available,
         "in_use": in_use,
-        "max_lists": MAX_LISTS,
         "timeout": SESSION_TIMEOUT,
         "playlist_url": playlist_url,
         "now": datetime.now(),
@@ -675,10 +673,6 @@ async def add_list(
         return RedirectResponse("/admin?msg=Nome+obrigatorio", status_code=302)
 
     conn = get_db()
-    count = conn.execute("SELECT COUNT(*) FROM m3u_lists").fetchone()[0]
-    if count >= MAX_LISTS:
-        conn.close()
-        return RedirectResponse(f"/admin?msg=Limite+de+{MAX_LISTS}+listas+atingido", status_code=302)
 
     u = username.strip()
     p = password.strip()

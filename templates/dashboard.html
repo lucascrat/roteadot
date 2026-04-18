@@ -33,7 +33,7 @@
     <div class="grid grid-cols-3 gap-4">
       <div class="bg-gray-900 border border-gray-800 rounded-2xl p-5">
         <p class="text-gray-500 text-xs uppercase tracking-widest mb-1">Total</p>
-        <p class="text-3xl font-bold text-white">{{ total }}<span class="text-gray-600 text-lg">/{{ max_lists }}</span></p>
+        <p class="text-3xl font-bold text-white">{{ total }}</p>
       </div>
       <div class="bg-gray-900 border border-gray-800 rounded-2xl p-5">
         <p class="text-gray-500 text-xs uppercase tracking-widest mb-1">Disponíveis</p>
@@ -78,16 +78,12 @@
             </button>
           </form>
           {% endif %}
-          {% if total < max_lists %}
           <button
             onclick="document.getElementById('add-form').classList.toggle('hidden')"
             class="text-xs bg-blue-700 hover:bg-blue-600 text-white font-semibold px-4 py-1.5 rounded-lg transition-colors"
           >
             + Adicionar Lista
           </button>
-          {% else %}
-          <span class="text-xs text-gray-500 px-3 py-1.5">Limite de {{ max_lists }} atingido</span>
-          {% endif %}
         </div>
       </div>
 
