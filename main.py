@@ -134,8 +134,8 @@ async def check_active_connections():
     """
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, name, username, password, session_ip, last_accessed, zero_streak "
-        "FROM m3u_lists WHERE status='in_use' AND username IS NOT NULL AND password IS NOT NULL"
+        "SELECT id, name, status, username, password, session_ip, last_accessed, zero_streak "
+        "FROM m3u_lists WHERE username IS NOT NULL AND password IS NOT NULL"
     ).fetchall()
     conn.close()
 
@@ -145,6 +145,36 @@ async def check_active_connections():
     now = datetime.now()
     for row in rows:
         result = await probe_provider(row["username"], row["password"])
+
+        # Re-atribui lista AVAILABLE se o provedor diz que tem conexao ativa.
+        # Cobre o caso do player (Ibo) reabrir e usar playlist em cache sem
+        # bater em /playlist.m3u.
+        if row["status"] == "available":
+            if result["ok"] and result["active"] and result["active"] > 0:
+                c = get_db()
+                c.execute(
+                    "UPDATE m3u_lists SET status='in_use', session_ip=?, "
+                    "last_accessed=?, last_active_cons=?, zero_streak=0, last_probe_at=? "
+                    "WHERE id=? AND status='available'",
+                    ("auto-detectado", now, result["active"], now, row["id"]),
+                )
+                c.execute(
+                    "INSERT INTO access_log (ip_address, list_id, list_name, action) "
+                    "VALUES (?,?,?,'auto_assigned')",
+                    ("auto-detectado", row["id"], row["name"]),
+                )
+                c.commit()
+                c.close()
+                logger.info(f"Lista id={row['id']} re-atribuida automaticamente (active_cons={result['active']})")
+            elif result["ok"]:
+                c = get_db()
+                c.execute(
+                    "UPDATE m3u_lists SET last_active_cons=?, last_probe_at=? WHERE id=?",
+                    (result["active"], now, row["id"]),
+                )
+                c.commit()
+                c.close()
+            continue
 
         c = get_db()
         if not result["ok"]:
