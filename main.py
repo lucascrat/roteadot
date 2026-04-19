@@ -510,7 +510,7 @@ async def fetch_m3u_gzip(row, conn=None) -> bytes:
         return _gz(f"#EXTM3U\n#EXTINF:-1,Erro: {exc}\nhttp://0.0.0.0\n")
 
 
-FORCE_GZIP = os.getenv("FORCE_GZIP", "1") == "1"
+FORCE_GZIP = os.getenv("FORCE_GZIP", "0") == "1"
 
 
 def playlist_response(blob: bytes, accept_encoding: str, user_agent: str = "", status_code: int = 200) -> Response:
